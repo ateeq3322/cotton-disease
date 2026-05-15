@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "968741198853",
+    "project_id": "cotton-3881f",
+    "storage_bucket": "cotton-3881f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:968741198853:android:22e6ad4c5dd88bd70a106c",
+        "android_client_info": {
+          "package_name": "com.example.cotton_disease"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "968741198853-fhl32noqbkrel1t8rp1nfo7vn4qhu1ap.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.cotton_disease",
+            "certificate_hash": "7bbf6b25960819c3e888bc11913a3c250177e553"
+          }
+        },
+        {
+          "client_id": "968741198853-devhk842iapph6rmkt97suhtu1i75v18.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAlUv6VPOJIEOegT6XJtPxgTWlvJuYcxs8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "968741198853-devhk842iapph6rmkt97suhtu1i75v18.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
