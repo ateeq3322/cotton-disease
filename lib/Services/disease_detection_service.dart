@@ -1,7 +1,8 @@
 // lib/services/disease_detection_service.dart
 // ─────────────────────────────────────────────────────────────
-// CropGuard — On-device TFLite inference + background heatmap
-// Fixes: interpreter lifecycle, isolate tensor build, no setState
+// FIX: Isolate messaging now uses ONLY primitive types.
+// _HeatmapMessage and _HeatmapResult replaced with plain List
+// and Map — the only types Dart isolates can send across ports.
 // ─────────────────────────────────────────────────────────────
 
 import 'dart:io';
@@ -13,7 +14,7 @@ import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
 
-// ── Result model ─────────────────────────────────────────────
+// ── Result model ──────────────────────────────────────────────
 class DetectionResult {
   final String diseaseKey;
   final String displayName;
@@ -53,25 +54,25 @@ class _DiseaseInfo {
   });
 }
 
-// ── Isolate message for tensor building ───────────────────────
-class _TensorMessage {
-  final SendPort sendPort;
-  final Uint8List imageBytes;
-  const _TensorMessage(this.sendPort, this.imageBytes);
-}
+// ─────────────────────────────────────────────────────────────
+// TOP-LEVEL ISOLATE FUNCTIONS
+// Must be top-level. Must send/receive ONLY primitives:
+//   bool, int, double, String, Uint8List, List, Map, null
+// NO custom classes across isolate boundary.
+// ─────────────────────────────────────────────────────────────
 
-// ── Top-level isolate entry (must be top-level, not static) ──
-void _buildTensorIsolate(_TensorMessage msg) {
+// ── Main inference tensor builder ────────────────────────────
+// Receives: List [SendPort, Uint8List]
+// Sends:    Float32List | null
+void _buildTensorIsolate(List<dynamic> args) {
+  final sendPort = args[0] as SendPort;
+  final imageBytes = args[1] as Uint8List;
   try {
-    final image = img.decodeImage(msg.imageBytes);
-    if (image == null) {
-      msg.sendPort.send(null);
-      return;
-    }
+    final image = img.decodeImage(imageBytes);
+    if (image == null) { sendPort.send(null); return; }
     final resized = img.copyResize(image, width: 224, height: 224);
 
-    // Build flat Float32List instead of nested lists — avoids GC pressure
-    final tensor = Float32List(1 * 224 * 224 * 3);
+    final tensor = Float32List(224 * 224 * 3);
     int idx = 0;
     for (int y = 0; y < 224; y++) {
       for (int x = 0; x < 224; x++) {
@@ -81,24 +82,129 @@ void _buildTensorIsolate(_TensorMessage msg) {
         tensor[idx++] = pixel.b / 255.0;
       }
     }
-    msg.sendPort.send(tensor);
-  } catch (e) {
-    msg.sendPort.send(null);
+    sendPort.send(tensor);
+  } catch (_) {
+    sendPort.send(null);
   }
 }
 
-// ── Main service ──────────────────────────────────────────────
+// ── Heatmap isolate ───────────────────────────────────────────
+// Receives: List [SendPort, Uint8List imageBytes, Uint8List modelBytes,
+//                 int targetClassIndex, int numClasses]
+// Sends:    List<List<double>> (7x7) on success
+//           empty List [] on failure
+void _heatmapIsolate(List<dynamic> args) {
+  final sendPort        = args[0] as SendPort;
+  final imageBytes      = args[1] as Uint8List;
+  final modelBytes      = args[2] as Uint8List;
+  final targetClassIdx  = args[3] as int;
+  final numClasses      = args[4] as int;
+
+  Interpreter? interpreter;
+  try {
+    interpreter = Interpreter.fromBuffer(modelBytes);
+
+    final image = img.decodeImage(imageBytes);
+    if (image == null) { sendPort.send(<List<double>>[]); return; }
+    final base = img.copyResize(image, width: 224, height: 224);
+
+    // Build flat Float32List from image
+    Float32List buildFlat(img.Image src) {
+      final flat = Float32List(224 * 224 * 3);
+      int i = 0;
+      for (int y = 0; y < 224; y++) {
+        for (int x = 0; x < 224; x++) {
+          final p = src.getPixel(x, y);
+          flat[i++] = p.r / 255.0;
+          flat[i++] = p.g / 255.0;
+          flat[i++] = p.b / 255.0;
+        }
+      }
+      return flat;
+    }
+
+    // Run one inference pass, return score for target class
+    double infer(Float32List flat) {
+      final input = flat.reshape([1, 224, 224, 3]);
+      final output = List.filled(numClasses, 0.0).reshape([1, numClasses]);
+      interpreter!.run(input, output);
+      return (output[0] as List)[targetClassIdx].toDouble();
+    }
+
+    final baseScore = infer(buildFlat(base));
+
+    const gridSize = 7;
+    const patchSize = 32;
+
+    // Use List<List<double>> — primitive-safe
+    final heatmap = List.generate(gridSize, (_) => List<double>.filled(gridSize, 0.0));
+
+    for (int gy = 0; gy < gridSize; gy++) {
+      for (int gx = 0; gx < gridSize; gx++) {
+        final occluded = img.copyResize(base, width: 224, height: 224);
+        final pxStart = gx * patchSize;
+        final pyStart = gy * patchSize;
+
+        for (int py = pyStart; py < min(pyStart + patchSize, 224); py++) {
+          for (int px = pxStart; px < min(pxStart + patchSize, 224); px++) {
+            occluded.setPixelRgb(px, py, 128, 128, 128);
+          }
+        }
+
+        final occScore = infer(buildFlat(occluded));
+        heatmap[gy][gx] = max(0.0, baseScore - occScore);
+      }
+    }
+
+    // Normalize 0→1
+    double maxVal = 0;
+    for (final row in heatmap) {
+      for (final v in row) { if (v > maxVal) maxVal = v; }
+    }
+    if (maxVal > 0) {
+      for (int y = 0; y < gridSize; y++) {
+        for (int x = 0; x < gridSize; x++) {
+          heatmap[y][x] /= maxVal;
+        }
+      }
+    }
+
+    interpreter.close();
+    // Send List<List<double>> — fully primitive, crosses isolate boundary safely
+    sendPort.send(heatmap);
+  } catch (e) {
+    interpreter?.close();
+    sendPort.send(<List<double>>[]);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Main service
+// ─────────────────────────────────────────────────────────────
 class DiseaseDetectionService {
-  // Singleton interpreter — never recreated, never double-closed
   static Interpreter? _interpreter;
   static Map<int, String> _labels = {};
   static bool _initialized = false;
   static bool _initializing = false;
 
-  // Heatmap cancellation token
+  static Isolate? _heatmapIsolateRef;
   static bool _heatmapCancelled = false;
 
+  // Raw model bytes — sent to heatmap isolate so it can build
+  // its own interpreter without needing rootBundle
+  static Uint8List? _modelBytes;
+
   static const Map<String, _DiseaseInfo> _diseaseDb = {
+    'healthy': _DiseaseInfo(
+      displayName: 'Healthy Leaf',
+      treatment:
+      'No treatment required. Maintain regular monitoring schedule. '
+          'Continue current irrigation and fertilization practices.',
+      treatmentUrdu:
+      'علاج کی ضرورت نہیں۔ باقاعدہ نگرانی جاری رکھیں۔ '
+          'موجودہ آبپاشی اور کھاد کا عمل جاری رکھیں۔',
+      isHealthy: true,
+    ),
     'diseased cotton leaf': _DiseaseInfo(
       displayName: 'Diseased Cotton Leaf',
       treatment:
@@ -143,11 +249,10 @@ class DiseaseDetectionService {
     ),
   };
 
-  // ── Initialize once ───────────────────────────────────────
+  // ── Initialize ────────────────────────────────────────────
   static Future<void> initialize() async {
     if (_initialized) return;
     if (_initializing) {
-      // Wait for ongoing init rather than double-initializing
       while (_initializing) {
         await Future.delayed(const Duration(milliseconds: 50));
       }
@@ -155,17 +260,16 @@ class DiseaseDetectionService {
     }
     _initializing = true;
     try {
+      final byteData = await rootBundle.load('assets/models/cotton_leaf_model.tflite');
+      _modelBytes = byteData.buffer.asUint8List();
+
       final options = InterpreterOptions()
         ..threads = 2
         ..useNnApiForAndroid = false;
 
-      _interpreter = await Interpreter.fromAsset(
-        'assets/models/cotton_leaf_model.tflite',
-        options: options,
-      );
+      _interpreter = Interpreter.fromBuffer(_modelBytes!, options: options);
 
-      final labelsJson =
-      await rootBundle.loadString('assets/models/labels.json');
+      final labelsJson = await rootBundle.loadString('assets/models/labels.json');
       final Map<String, dynamic> raw = json.decode(labelsJson);
       _labels = raw.map((k, v) => MapEntry(int.parse(k), v as String));
 
@@ -177,18 +281,17 @@ class DiseaseDetectionService {
     _initializing = false;
   }
 
-  // ── Build tensor in isolate — no main-thread GC pressure ──
+  // ── Build input tensor in isolate (main inference) ────────
   static Future<List?> _buildTensorInIsolate(Uint8List imageBytes) async {
     final receivePort = ReceivePort();
     await Isolate.spawn(
       _buildTensorIsolate,
-      _TensorMessage(receivePort.sendPort, imageBytes),
+      [receivePort.sendPort, imageBytes], // plain List — no custom class
     );
     final result = await receivePort.first;
     receivePort.close();
     if (result == null) return null;
 
-    // Reshape Float32List → [1, 224, 224, 3] nested list for tflite_flutter
     final flat = result as Float32List;
     return List.generate(
       1,
@@ -217,9 +320,7 @@ class DiseaseDetectionService {
       if (inputTensor == null) return null;
 
       final numClasses = _labels.length;
-      final outputTensor =
-      List.filled(numClasses, 0.0).reshape([1, numClasses]);
-
+      final outputTensor = List.filled(numClasses, 0.0).reshape([1, numClasses]);
       _interpreter!.run(inputTensor, outputTensor);
 
       final scores = List<double>.from(outputTensor[0] as List);
@@ -232,7 +333,7 @@ class DiseaseDetectionService {
         }
       }
 
-      final diseaseKey = _labels[maxIndex] ?? 'unknown';
+      final diseaseKey = (_labels[maxIndex] ?? 'unknown').toLowerCase().trim();
       final info = _diseaseDb[diseaseKey];
 
       return DetectionResult(
@@ -246,117 +347,57 @@ class DiseaseDetectionService {
         isHealthy: info?.isHealthy ?? false,
         heatmapData: [],
       );
-    } catch (e) {
+    } catch (_) {
       return null;
     }
   }
 
-  // ── Cancel ongoing heatmap (call before new scan) ─────────
+  // ── Cancel heatmap ────────────────────────────────────────
   static void cancelHeatmap() {
     _heatmapCancelled = true;
+    _heatmapIsolateRef?.kill(priority: Isolate.immediate);
+    _heatmapIsolateRef = null;
   }
 
-  // ── Heatmap via occlusion — cancellable, async, 49 passes ─
+  // ── Heatmap — background isolate, primitives only ─────────
   static Future<List<List<double>>> computeHeatmap(
       File imageFile,
       int targetClassIndex,
       ) async {
-    if (!_initialized || _interpreter == null) return [];
+    if (!_initialized || _interpreter == null || _modelBytes == null) return [];
     _heatmapCancelled = false;
 
     try {
-      final bytes = await imageFile.readAsBytes();
-      img.Image? image = img.decodeImage(bytes);
-      if (image == null) return [];
-      image = img.copyResize(image, width: 224, height: 224);
-      return await _generateAttentionMap(image, targetClassIndex);
-    } catch (e) {
+      final imageBytes = await imageFile.readAsBytes();
+      final numClasses = _labels.length;
+      final receivePort = ReceivePort();
+
+      _heatmapIsolateRef = await Isolate.spawn(
+        _heatmapIsolate,
+        // Plain List — all primitives, safe across isolate boundary
+        [
+          receivePort.sendPort,
+          imageBytes,
+          _modelBytes!,
+          targetClassIndex,
+          numClasses,
+        ],
+      );
+
+      final raw = await receivePort.first;
+      receivePort.close();
+      _heatmapIsolateRef = null;
+
+      if (_heatmapCancelled) return [];
+
+      // Cast from dynamic
+      final result = (raw as List).cast<List<double>>();
+      return result.isEmpty ? [] : result;
+    } catch (e, st) {
+      print('HEATMAP ERROR: $e');
+      print('STACK: $st');
       return [];
     }
-  }
-
-  static Future<List<List<double>>> _generateAttentionMap(
-      img.Image originalImage,
-      int targetClass,
-      ) async {
-    const gridSize = 7;
-    const patchSize = 32;
-    final heatmap =
-    List.generate(gridSize, (_) => List.filled(gridSize, 0.0));
-
-    final baseScore = _inferScoreSync(originalImage, targetClass);
-
-    for (int gy = 0; gy < gridSize; gy++) {
-      for (int gx = 0; gx < gridSize; gx++) {
-        // Check cancellation each patch
-        if (_heatmapCancelled) return [];
-
-        final occluded =
-        img.copyResize(originalImage, width: 224, height: 224);
-        final pxStart = gx * patchSize;
-        final pyStart = gy * patchSize;
-
-        for (int py = pyStart; py < min(pyStart + patchSize, 224); py++) {
-          for (int px = pxStart; px < min(pxStart + patchSize, 224); px++) {
-            occluded.setPixelRgb(px, py, 128, 128, 128);
-          }
-        }
-
-        final occScore = _inferScoreSync(occluded, targetClass);
-        heatmap[gy][gx] = max(0, baseScore - occScore);
-
-        // Yield to event loop after each row to avoid ANR
-        if (gx == gridSize - 1) {
-          await Future.delayed(Duration.zero);
-        }
-      }
-    }
-
-    // Normalize
-    double maxVal = 0;
-    for (var row in heatmap) {
-      for (var v in row) {
-        if (v > maxVal) maxVal = v;
-      }
-    }
-    if (maxVal > 0) {
-      for (int y = 0; y < gridSize; y++) {
-        for (int x = 0; x < gridSize; x++) {
-          heatmap[y][x] /= maxVal;
-        }
-      }
-    }
-    return heatmap;
-  }
-
-  // Sync inference — used only inside heatmap loop (already async-yielding)
-  static double _inferScoreSync(img.Image image, int targetClass) {
-    final inputTensor = _buildTensorSync(image);
-    final numClasses = _labels.length;
-    final outputTensor =
-    List.filled(numClasses, 0.0).reshape([1, numClasses]);
-    _interpreter!.run(inputTensor, outputTensor);
-    return (outputTensor[0] as List)[targetClass].toDouble();
-  }
-
-  static List _buildTensorSync(img.Image image) {
-    return List.generate(
-      1,
-          (_) => List.generate(
-        224,
-            (y) => List.generate(
-          224,
-              (x) {
-            final pixel = image.getPixel(x, y);
-            return [
-              pixel.r / 255.0,
-              pixel.g / 255.0,
-              pixel.b / 255.0,
-            ];
-          },
-        ),
-      ),
-    );
   }
 
   static int getLabelIndex(String diseaseKey) {
@@ -380,11 +421,11 @@ class DiseaseDetectionService {
     return 'کم';
   }
 
-  // ── Dispose — only call when app exits, NOT between scans ─
   static void dispose() {
-    _heatmapCancelled = true;
+    cancelHeatmap();
     _interpreter?.close();
     _interpreter = null;
+    _modelBytes = null;
     _initialized = false;
     _initializing = false;
   }

@@ -1,5 +1,6 @@
 import 'package:animated_text_kit/animated_text_kit.dart';
 import 'package:cotton_disease/MainPage.dart';
+import 'package:cotton_disease/Provider/NotificationProvider.dart';
 import 'package:cotton_disease/screens/onBoardingScreen/onBoardingScreen.dart';
 import 'package:cotton_disease/utils/constants/colors.dart';
 import 'package:flutter/material.dart';
@@ -60,11 +61,13 @@ class _SplashScreenState extends State<SplashScreen>
   }
 
   Future<void> initializeTheme() async {
-    final themePreference = await SharedPreferences.getInstance();
-    final provider = Provider.of<DarkModeProvider>(context, listen: false);
-
-    final isDarkTheme = themePreference.getBool('isDarkMode') ?? true;
-    provider.toggleMode(isDarkTheme);
+    final preference = await SharedPreferences.getInstance();
+    final themeProvider = Provider.of<DarkModeProvider>(context, listen: false);
+    final notificationProvider = Provider.of<NotificationProvider>(context, listen: false);
+    final isDarkTheme = preference.getBool('isDarkMode') ?? true;
+    themeProvider.toggleMode(isDarkTheme);
+    final isNotificationAllowed = preference.getBool('isNotificationOn') ?? false;
+    notificationProvider.toggleNotification(isNotificationAllowed);
   }
 
   @override
@@ -106,7 +109,7 @@ class _SplashScreenState extends State<SplashScreen>
                 isRepeatingAnimation: false,
                 animatedTexts: [
                   ColorizeAnimatedText(
-                    "COTTON\nDISEASE AI",
+                    "Crop Guard",
                     textAlign: TextAlign.center,
                     textStyle: GoogleFonts.exo2(fontSize: 28),
                     colors: [

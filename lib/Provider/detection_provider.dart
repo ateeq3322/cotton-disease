@@ -1,12 +1,10 @@
 // lib/providers/detection_provider.dart
 // ─────────────────────────────────────────────────────────────
 // CropGuard — Detection state provider
-// Fixes: heatmap cancelled before reset, no setState anywhere,
-//        PDF font loaded once, snack cleared before notify
+// Added: heatmap computation state + toggleHeatmap()
 // ─────────────────────────────────────────────────────────────
 
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -17,89 +15,102 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:open_file/open_file.dart';
 import '../services/disease_detection_service.dart';
+import 'WeatherProvider.dart';
 
 enum DetectionStatus { idle, inferring, done, error }
-enum HeatmapStatus { idle, computing, done }
 enum SaveStatus { idle, saving, saved, failed }
 enum PdfStatus { idle, generating, done, failed }
+// NEW
+enum HeatmapStatus { idle, computing, done, failed }
 
 class DetectionProvider extends ChangeNotifier {
   DetectionResult? _result;
   DetectionStatus _status = DetectionStatus.idle;
-  HeatmapStatus _heatmapStatus = HeatmapStatus.idle;
   SaveStatus _saveStatus = SaveStatus.idle;
   PdfStatus _pdfStatus = PdfStatus.idle;
-  bool _showHeatmap = true;
   String? _lastSnackMessage;
   bool _snackIsError = false;
 
-  // Track if provider is still active (disposed guard)
+  // Weather captured at detection time — null if unavailable
+  WeatherSnapshot? _weatherSnapshot;
+
+  // ── Heatmap state ─────────────────────────────────────────
+  HeatmapStatus _heatmapStatus = HeatmapStatus.idle;
+  List<List<double>> _heatmapData = [];
+  bool _heatmapVisible = false;
+
   bool _alive = true;
 
   // ── Getters ───────────────────────────────────────────────
   DetectionResult? get result => _result;
+  WeatherSnapshot? get weatherSnapshot => _weatherSnapshot;
   bool get isInferring => _status == DetectionStatus.inferring;
   bool get isDone => _status == DetectionStatus.done;
   bool get isError => _status == DetectionStatus.error;
-  bool get showHeatmap => _showHeatmap;
-  bool get heatmapReady =>
-      _heatmapStatus == HeatmapStatus.done &&
-          (_result?.heatmapData.isNotEmpty ?? false);
-  bool get heatmapComputing => _heatmapStatus == HeatmapStatus.computing;
   bool get savedToHistory => _saveStatus == SaveStatus.saved;
   bool get isSaving => _saveStatus == SaveStatus.saving;
   bool get isGeneratingPdf => _pdfStatus == PdfStatus.generating;
   String? get lastSnackMessage => _lastSnackMessage;
   bool get snackIsError => _snackIsError;
 
+  // Heatmap getters
+  bool get isComputingHeatmap => _heatmapStatus == HeatmapStatus.computing;
+  bool get heatmapReady => _heatmapStatus == HeatmapStatus.done && _heatmapData.isNotEmpty;
+  bool get heatmapVisible => _heatmapVisible;
+  List<List<double>> get heatmapData => _heatmapData;
+
   void _safeNotify() {
     if (_alive) notifyListeners();
   }
 
-  // ── Reset — cancels heatmap before wiping state ───────────
+  // ── Reset ─────────────────────────────────────────────────
   void reset() {
-    // DiseaseDetectionService.cancelHeatmap();
     _result = null;
     _status = DetectionStatus.idle;
-    _heatmapStatus = HeatmapStatus.idle;
     _saveStatus = SaveStatus.idle;
     _pdfStatus = PdfStatus.idle;
-    _showHeatmap = true;
+    _weatherSnapshot = null;
     _lastSnackMessage = null;
-    _safeNotify();
-  }
-
-  void toggleHeatmap(bool value) {
-    _showHeatmap = value;
+    _heatmapStatus = HeatmapStatus.idle;
+    _heatmapData = [];
+    _heatmapVisible = false;
+    DiseaseDetectionService.cancelHeatmap();
     _safeNotify();
   }
 
   void clearSnack() {
     _lastSnackMessage = null;
-    // No notify here — avoids rebuild loop; screen reads and clears in build
   }
 
-  // ── Step 1: Inference ─────────────────────────────────────
-  Future<void> runDetection(File imageFile) async {
+  // ── Step 1: Inference + Weather snapshot ──────────────────
+  Future<void> runDetection(
+      File imageFile,
+      WeatherProvider weatherProvider,
+      ) async {
     _status = DetectionStatus.inferring;
     _safeNotify();
 
     try {
-      final result = await DiseaseDetectionService.detectDisease(imageFile);
+      final results = await Future.wait([
+        DiseaseDetectionService.detectDisease(imageFile),
+        weatherProvider.getSnapshot(),
+      ]);
+
       if (!_alive) return;
 
-      if (result == null) {
+      final DetectionResult? detectionResult = results[0] as DetectionResult?;
+      final WeatherSnapshot? snapshot = results[1] as WeatherSnapshot?;
+
+      if (detectionResult == null) {
         _status = DetectionStatus.error;
         _safeNotify();
         return;
       }
 
-      _result = result;
+      _result = detectionResult;
+      _weatherSnapshot = snapshot;
       _status = DetectionStatus.done;
       _safeNotify();
-
-      // Fire heatmap without awaiting — runs in background
-      _computeHeatmap(imageFile, result.diseaseKey);
     } catch (_) {
       if (!_alive) return;
       _status = DetectionStatus.error;
@@ -107,34 +118,50 @@ class DetectionProvider extends ChangeNotifier {
     }
   }
 
-  // ── Step 2: Heatmap (background) ─────────────────────────
-  Future<void> _computeHeatmap(File imageFile, String diseaseKey) async {
-    if (!_alive) return;
+  // ── NEW: Toggle heatmap ───────────────────────────────────
+  // If healthy → caller should show snackbar, don't call this.
+  // If disease → compute on first toggle, then just flip visibility.
+  Future<void> toggleHeatmap(File imageFile) async {
+    if (_result == null || _result!.isHealthy) return;
+
+    // Already computed — just flip visibility
+    if (heatmapReady) {
+      _heatmapVisible = !_heatmapVisible;
+      _safeNotify();
+      return;
+    }
+
+    // Currently computing — ignore tap
+    if (isComputingHeatmap) return;
+
+    // First time: compute
     _heatmapStatus = HeatmapStatus.computing;
+    _heatmapVisible = false;
     _safeNotify();
 
     try {
-      final targetIndex =
-      DiseaseDetectionService.getLabelIndex(diseaseKey);
-      final heatmap = await DiseaseDetectionService.computeHeatmap(
-        imageFile,
-        targetIndex,
-      );
+      final labelIndex = DiseaseDetectionService.getLabelIndex(_result!.diseaseKey);
+      final data = await DiseaseDetectionService.computeHeatmap(imageFile, labelIndex);
 
       if (!_alive) return;
 
-      // If cancelled (reset called while computing) heatmap returns []
-      if (heatmap.isNotEmpty) {
-        _result?.heatmapData = heatmap;
-        _heatmapStatus = HeatmapStatus.done;
-      } else {
-        _heatmapStatus = HeatmapStatus.idle;
+      if (data.isEmpty) {
+        _heatmapStatus = HeatmapStatus.failed;
+        _setSnack('Heatmap computation failed.', isError: true);
+        _safeNotify();
+        return;
       }
-    } catch (_) {
+
+      _heatmapData = data;
+      _heatmapStatus = HeatmapStatus.done;
+      _heatmapVisible = true; // auto-show after first compute
+      _safeNotify();
+    } catch (e) {
       if (!_alive) return;
-      _heatmapStatus = HeatmapStatus.idle;
+      _heatmapStatus = HeatmapStatus.failed;
+      _setSnack('Heatmap error: $e', isError: true);
+      _safeNotify();
     }
-    _safeNotify();
   }
 
   // ── Save to Firestore ─────────────────────────────────────
@@ -168,11 +195,7 @@ class DetectionProvider extends ChangeNotifier {
 
       if (!_alive) return;
 
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(user.uid)
-          .collection('detections')
-          .add({
+      final Map<String, dynamic> doc = {
         'diseaseKey': _result!.diseaseKey,
         'displayName': _result!.displayName,
         'confidence': _result!.confidence,
@@ -182,7 +205,18 @@ class DetectionProvider extends ChangeNotifier {
         'timestamp': FieldValue.serverTimestamp(),
         'latitude': lat,
         'longitude': lng,
-      });
+        'weatherCity': _weatherSnapshot?.cityName,
+        'weatherTemp': _weatherSnapshot?.temperatureCelsius,
+        'weatherMain': _weatherSnapshot?.weatherMain,
+        'weatherHumidity': _weatherSnapshot?.humidity,
+        'weatherWindSpeed': _weatherSnapshot?.windSpeed,
+      };
+
+      await FirebaseFirestore.instance
+          .collection('users')
+          .doc(user.uid)
+          .collection('detections')
+          .add(doc);
 
       if (!_alive) return;
       _saveStatus = SaveStatus.saved;
@@ -211,11 +245,14 @@ class DetectionProvider extends ChangeNotifier {
       final font = await pw.Font.ttf(
         await rootBundle.load('assets/fonts/Abel-Regular.ttf'),
       );
-      final fontBold = font; // same file — replace with bold variant if available
 
       final now = DateTime.now();
       final dateStr =
-          '${now.day}/${now.month}/${now.year} ${now.hour}:${now.minute.toString().padLeft(2, '0')}';
+          '${now.day}/${now.month}/${now.year}  ${now.hour}:${now.minute.toString().padLeft(2, '0')}';
+
+      final String weatherStr = _weatherSnapshot != null
+          ? '${_weatherSnapshot!.cityName}  ·  ${_weatherSnapshot!.tempFormatted}  ·  ${_weatherSnapshot!.weatherMain}'
+          : 'Weather data unavailable';
 
       pdf.addPage(
         pw.Page(
@@ -224,7 +261,6 @@ class DetectionProvider extends ChangeNotifier {
           build: (pw.Context ctx) => pw.Column(
             crossAxisAlignment: pw.CrossAxisAlignment.start,
             children: [
-              // Header
               pw.Container(
                 width: double.infinity,
                 padding: const pw.EdgeInsets.all(16),
@@ -237,27 +273,23 @@ class DetectionProvider extends ChangeNotifier {
                   children: [
                     pw.Text('CropGuard',
                         style: pw.TextStyle(
-                            font: fontBold,
+                            font: font,
                             fontSize: 24,
+                            fontWeight: pw.FontWeight.bold,
                             color: PdfColors.white)),
                     pw.SizedBox(height: 4),
                     pw.Text('Cotton Disease Detection Report',
-                        style: pw.TextStyle(
-                            font: font,
-                            fontSize: 13,
-                            color: PdfColors.white)),
+                        style: pw.TextStyle(font: font, fontSize: 13, color: PdfColors.white)),
                     pw.SizedBox(height: 4),
                     pw.Text('Generated: $dateStr',
-                        style: pw.TextStyle(
-                            font: font,
-                            fontSize: 11,
-                            color: PdfColor.fromHex('#d4f5e4'))),
+                        style: pw.TextStyle(font: font, fontSize: 11, color: PdfColor.fromHex('#d4f5e4'))),
+                    pw.SizedBox(height: 2),
+                    pw.Text('Field Conditions: $weatherStr',
+                        style: pw.TextStyle(font: font, fontSize: 10, color: PdfColor.fromHex('#d4f5e4'))),
                   ],
                 ),
               ),
-
               pw.SizedBox(height: 24),
-
               pw.Row(
                 crossAxisAlignment: pw.CrossAxisAlignment.start,
                 children: [
@@ -266,8 +298,7 @@ class DetectionProvider extends ChangeNotifier {
                     height: 200,
                     decoration: pw.BoxDecoration(
                       borderRadius: pw.BorderRadius.circular(8),
-                      border: pw.Border.all(
-                          color: PdfColor.fromHex('#E5E7EB'), width: 1),
+                      border: pw.Border.all(color: PdfColor.fromHex('#E5E7EB'), width: 1),
                     ),
                     child: pw.ClipRRect(
                       horizontalRadius: 8,
@@ -285,7 +316,8 @@ class DetectionProvider extends ChangeNotifier {
                         pw.Text(
                           _result!.displayName,
                           style: pw.TextStyle(
-                            font: fontBold,
+                            font: font,
+                            fontWeight: pw.FontWeight.bold,
                             fontSize: 16,
                             color: _result!.isHealthy
                                 ? PdfColor.fromHex('#22C55E')
@@ -297,15 +329,13 @@ class DetectionProvider extends ChangeNotifier {
                         pw.SizedBox(height: 4),
                         pw.Text(
                           '${(_result!.confidence * 100).toStringAsFixed(1)}%',
-                          style:
-                          pw.TextStyle(font: fontBold, fontSize: 14),
+                          style: pw.TextStyle(font: font, fontWeight: pw.FontWeight.bold, fontSize: 14),
                         ),
                         pw.SizedBox(height: 12),
                         _pdfLabel('Severity', font),
                         pw.SizedBox(height: 4),
                         pw.Container(
-                          padding: const pw.EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 4),
+                          padding: const pw.EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                           decoration: pw.BoxDecoration(
                             color: _result!.isHealthy
                                 ? PdfColor.fromHex('#DCFCE7')
@@ -317,7 +347,8 @@ class DetectionProvider extends ChangeNotifier {
                           child: pw.Text(
                             _result!.severity,
                             style: pw.TextStyle(
-                              font: fontBold,
+                              font: font,
+                              fontWeight: pw.FontWeight.bold,
                               fontSize: 12,
                               color: _result!.isHealthy
                                   ? PdfColor.fromHex('#15803D')
@@ -331,29 +362,39 @@ class DetectionProvider extends ChangeNotifier {
                         _pdfLabel('Status', font),
                         pw.SizedBox(height: 4),
                         pw.Text(
-                          _result!.isHealthy
-                              ? 'Healthy'
-                              : 'Disease Detected',
+                          _result!.isHealthy ? 'Healthy' : 'Disease Detected',
                           style: pw.TextStyle(
-                            font: fontBold,
+                            font: font,
+                            fontWeight: pw.FontWeight.bold,
                             fontSize: 13,
                             color: _result!.isHealthy
                                 ? PdfColor.fromHex('#22C55E')
                                 : PdfColor.fromHex('#EF4444'),
                           ),
                         ),
+                        if (_weatherSnapshot != null) ...[
+                          pw.SizedBox(height: 12),
+                          _pdfLabel('Field Conditions', font),
+                          pw.SizedBox(height: 4),
+                          pw.Text(
+                            '${_weatherSnapshot!.cityName}',
+                            style: pw.TextStyle(font: font, fontWeight: pw.FontWeight.bold, fontSize: 12),
+                          ),
+                          pw.Text(
+                            '${_weatherSnapshot!.tempFormatted}  ·  ${_weatherSnapshot!.weatherMain}  ·  Humidity ${_weatherSnapshot!.humidity.toStringAsFixed(0)}%',
+                            style: pw.TextStyle(font: font, fontSize: 11, color: PdfColors.grey700),
+                          ),
+                        ],
                       ],
                     ),
                   ),
                 ],
               ),
-
               pw.SizedBox(height: 24),
               pw.Divider(color: PdfColor.fromHex('#E5E7EB')),
               pw.SizedBox(height: 16),
-
               pw.Text('Recommended Action',
-                  style: pw.TextStyle(font: fontBold, fontSize: 14)),
+                  style: pw.TextStyle(font: font, fontWeight: pw.FontWeight.bold, fontSize: 14)),
               pw.SizedBox(height: 8),
               pw.Container(
                 width: double.infinity,
@@ -371,55 +412,19 @@ class DetectionProvider extends ChangeNotifier {
                 ),
                 child: pw.Text(
                   _result!.treatment,
-                  style:
-                  pw.TextStyle(font: font, fontSize: 12, lineSpacing: 4),
+                  style: pw.TextStyle(font: font, fontSize: 12, lineSpacing: 4),
                 ),
               ),
-
-              pw.SizedBox(height: 16),
-
-              pw.Container(
-                width: double.infinity,
-                padding: const pw.EdgeInsets.all(14),
-                decoration: pw.BoxDecoration(
-                  color: PdfColor.fromHex('#F8FAFC'),
-                  borderRadius: pw.BorderRadius.circular(8),
-                  border: pw.Border.all(
-                      color: PdfColor.fromHex('#E2E8F0')),
-                ),
-                child: pw.Column(
-                  crossAxisAlignment: pw.CrossAxisAlignment.end,
-                  children: [
-                    pw.Text(
-                      'سفارش کردہ اقدام (اردو)',
-                      style: pw.TextStyle(font: fontBold, fontSize: 12),
-                      textDirection: pw.TextDirection.rtl,
-                    ),
-                    pw.SizedBox(height: 6),
-                    pw.Text(
-                      _result!.treatmentUrdu,
-                      style: pw.TextStyle(
-                          font: font, fontSize: 11, lineSpacing: 4),
-                      textDirection: pw.TextDirection.rtl,
-                    ),
-                  ],
-                ),
-              ),
-
               pw.Spacer(),
-
               pw.Divider(color: PdfColor.fromHex('#E5E7EB')),
               pw.SizedBox(height: 8),
               pw.Row(
                 mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
                 children: [
                   pw.Text('CropGuard — AI Cotton Disease Detection',
-                      style: pw.TextStyle(
-                          font: font, fontSize: 9, color: PdfColors.grey)),
-                  pw.Text(
-                      'For agricultural use only. Consult an expert for confirmation.',
-                      style: pw.TextStyle(
-                          font: font, fontSize: 9, color: PdfColors.grey)),
+                      style: pw.TextStyle(font: font, fontSize: 9, color: PdfColors.grey)),
+                  pw.Text('For agricultural use only. Consult an expert for confirmation.',
+                      style: pw.TextStyle(font: font, fontSize: 9, color: PdfColors.grey)),
                 ],
               ),
             ],
@@ -466,7 +471,7 @@ class DetectionProvider extends ChangeNotifier {
   @override
   void dispose() {
     _alive = false;
-    // DiseaseDetectionService.cancelHeatmap();
+    DiseaseDetectionService.cancelHeatmap();
     super.dispose();
   }
 }

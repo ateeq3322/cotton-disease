@@ -1,8 +1,12 @@
 import 'package:cotton_disease/Provider/ThemeProvider.dart';
 import 'package:cotton_disease/screens/Login/Login.dart';
+import 'package:cotton_disease/screens/Profile/aboutCottonSenseScreen.dart';
+import 'package:cotton_disease/screens/Profile/privacyPolicyScreen.dart';
+import 'package:cotton_disease/screens/Profile/termsOfServiceScreen.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../../Provider/NotificationProvider.dart';
 import '../../Services/EmailAuthService.dart';
 import '../../utils/ProfileWidget.dart';
 import '../../utils/constants/colors.dart';
@@ -18,7 +22,6 @@ class Profile extends StatefulWidget {
 }
 
 class _ProfileState extends State<Profile> {
-  bool isNotificationOn = true;
 
   Future<void> savePreference(String key, bool value) async {
     final prefs = await SharedPreferences.getInstance();
@@ -29,6 +32,7 @@ class _ProfileState extends State<Profile> {
   Widget build(BuildContext context) {
     final themeProvider = context.watch<DarkModeProvider>();
     final isDark = themeProvider.isDarkMode;
+    final isNotificationOn = context.watch<NotificationProvider>().isNotificationOn;
 
     final Color bgColor = isDark ? darkBlack : screenBg;
     final Color textColor = isDark ? white : chocolateBlack;
@@ -60,6 +64,7 @@ class _ProfileState extends State<Profile> {
           padding: const EdgeInsets.all(16),
           child: ListView(
             children: [
+
               /// 🧑‍🌾 Profile Card
               const ProfileCard(),
 
@@ -91,9 +96,11 @@ class _ProfileState extends State<Profile> {
                 title: "Notifications",
                 subtitle: "Receive alerts for crop health",
                 value: isNotificationOn,
-                onChanged: (val) => setState(() => isNotificationOn = val),
+                onChanged: (val) {
+                  savePreference('isNotificationOn', val);  // SharedPrefs save
+                  context.read<NotificationProvider>().toggleNotification(val); // provider update
+                },
               ),
-
               const SizedBox(height: 25),
 
               /// 🧾 App Information
@@ -104,9 +111,18 @@ class _ProfileState extends State<Profile> {
               ),
               const SizedBox(height: 15),
 
-              InfoTile(title: "About CottonSense", onTap: () {}),
-              InfoTile(title: "Privacy Policy", onTap: () {}),
-              InfoTile(title: "Terms of Service", onTap: () {}),
+              InfoTile(title: "About Cotton Sense", onTap: () {
+                Navigator.push(
+                    context, MaterialPageRoute(builder: (context) =>AboutCottonSenseScreen()));
+              }),
+              InfoTile(title: "Privacy Policy", onTap: () {
+                Navigator.push(
+                    context, MaterialPageRoute(builder: (context) =>PrivacyPolicyScreen()));
+              }),
+              InfoTile(title: "Terms of Service", onTap: () {
+                Navigator.push(
+                    context, MaterialPageRoute(builder: (context) =>TermsOfServiceScreen()));
+              }),
             ],
           ),
         ),

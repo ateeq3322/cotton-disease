@@ -24,7 +24,7 @@ class _BottomNavBarState extends State<BottomNavBar> {
   final List<Widget> _screens = [
     HomeScreen(),
     Scan(),
-    Reports(),
+    HistoryScreen(),
     KnowledgeHub(),
     WeatherScreen(),
     Profile(),

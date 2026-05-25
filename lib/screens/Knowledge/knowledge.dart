@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../utils/constants/colors.dart';
 import '../../utils/constants/fonts.dart';
+import 'LearnMoreScreen.dart';
 
 class KnowledgeHub extends StatelessWidget {
   const KnowledgeHub({super.key});
@@ -129,7 +130,14 @@ class KnowledgeHub extends StatelessWidget {
                             Align(
                               alignment: Alignment.centerLeft,
                               child: TextButton(
-                                onPressed: () {},
+                                onPressed: () {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => LearnMoreScreen(disease: allDiseases[index]),
+                                    ),
+                                  );
+                                },
                                 style: TextButton.styleFrom(
                                   backgroundColor:
                                   isDark ? darkGreen : green50,
