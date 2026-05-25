@@ -9,7 +9,7 @@
 
 
     <application
-        android:label="cotton_disease"
+        android:label="Crop Guard"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:enableOnBackInvokedCallback="true">
